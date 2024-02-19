@@ -1,0 +1,275 @@
+---
+title: "CTMC"
+author: "Jair Andrade"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(doParallel)
+library(doRNG)
+library(dplyr)
+library(ggplot2)
+library(pomp)
+library(purrr)
+library(readsdr)
+library(stringr)
+library(tictoc)
+
+source("./R_scripts/local_search.R")
+source("./R_scripts/loglik_funs.R")
+source("./R_scripts/plots.R")
+
+folder <- "./saved_objects"
+```
+
+```{r}
+N_val <- 5234
+```
+
+```{r}
+dat_df <- Maryland |> 
+  select(Cumberland) |> 
+  mutate(time = as.numeric(row_number()), .before = everything()) |> 
+  rename(y = Cumberland) |> 
+  as.data.frame()
+```
+
+```{r}
+rinit <- Csnippet("
+  S = nearbyint(N - I_0 - R_0);
+  E = 0;
+  I = nearbyint(I_0);
+  R = nearbyint(R_0);
+  C = 0;") 
+
+dmeas <- "
+  lik = dnbinom_mu(y, 1 / par_inv_phi, C, give_log);
+"
+
+SEIR_step <- "
+  double rate[3];
+  double dN[3];
+  rate[0] = par_beta * I / N; // transmission
+  rate[1] = par_sigma;        // symptom onset
+  rate[2] = par_gamma;        // recovery
+  reulermultinom(1, S, &rate[0], dt, &dN[0]);
+  reulermultinom(1, E, &rate[1], dt, &dN[1]);
+  reulermultinom(1, I, &rate[2], dt, &dN[2]);
+  S += - dN[0];
+  E += dN[0] - dN[1];
+  I += dN[1] - dN[2];
+  R += dN[2];
+  C += par_rho * dN[1];
+"
+
+dt <- 1/64
+
+params <- c(par_beta = 1, par_sigma = 0.5, par_gamma = 0.5,
+                            par_rho = 0.75, I_0 = 1, R_0 = 0.3 * N_val,
+                            N = N_val, par_inv_phi = 1/15)
+
+fixed_params <- params[names(params) %in% c("par_sigma", "par_gamma", "R_0",
+                                            "N")]
+
+pomp_mdl <- pomp(data = dat_df,
+                 times = "time", 
+                 t0 = 0,
+                 rinit = rinit,
+                 rprocess = pomp::euler(Csnippet(SEIR_step), delta.t = dt),
+                 dmeasure = Csnippet(dmeas),
+                 statenames = c("S", "E", "I", "R", "C"),
+                 paramnames = c("par_beta", "par_sigma", "par_gamma", 
+                                "par_rho", "N", "I_0", "R_0",
+                                "par_inv_phi"),
+                 accumvars = "C",
+                 params = params,
+                 partrans = parameter_trans(
+                   log   = c("par_beta", "par_inv_phi", "I_0"),
+                   logit = "par_rho"),
+                 cdir     = ".",
+                 cfile    = "CTMC_SEIR")
+```
+
+```{r}
+pf <- replicate(10, pfilter(pomp_mdl, Np = 5000))
+ll <- sapply(pf,logLik)
+logmeanexp(ll, se=TRUE)
+```
+
+
+
+```{r}
+ptb <- rw_sd(I_0 = ivp(0.02), par_beta = 0.02, par_rho = 0.02, 
+             par_inv_phi = 0.02)
+
+seed <- 94638
+fn   <- "./saved_objects/local_search.rds"
+
+ls_obj <- local_search(pomp_mdl, ptb, fn, seed, n_cores = 7)
+```
+
+```{r}
+mifs_local <- ls_obj$result
+
+mifs_local |> 
+  traces() |> 
+  melt() -> traces_df 
+
+mif_traces(traces_df, c("par_beta", "par_rho", "I0", "par_inv_phi"), 
+           "#344D77")
+```
+
+### Likelihood estimates
+
+\hfill
+
+
+```{r}
+fn <- file.path(folder, "local_search_ll.rds")
+
+ll_local_search_obj <- mif_ll(mifs_local, seed = 359084918, 
+                              n_cores = 7, filename = fn, Np = 1e4)
+```
+
+```{r}
+df <- bind_rows(ll_local_search_obj$ll_results)
+```
+
+## Global search
+
+### Likelihood maximisation
+
+\hfill
+
+```{r}
+mf1          <- ls_obj$result[[1]] 
+
+set.seed(583088)
+
+runif_design(
+  lower = c(par_beta = 0.1, par_rho = 0, I_0 = 0.5,  par_inv_phi = 0.01),
+  upper = c(par_beta = 3.0, par_rho = 1, I_0 = 30, par_inv_phi = 1.00),
+  nseq  = 300) -> guesses
+
+fn     <- file.path(folder, "Global_search.rds")
+seed   <- 48341889
+
+gs_obj <- global_search(guesses, fixed_params, mf1, fn, seed, 7)
+```
+```{r, message = FALSE, fig.height = 3.5}
+mifs_global <- extract_mif_results(gs_obj)
+
+mifs_global |>  
+  traces() |> 
+  melt() -> traces_df 
+
+mif_traces(traces_df, c("par_beta", "par_rho", "I0", "par_inv_phi"), 
+           "#344D77")
+```
+
+### Likelihood estimates
+
+
+```{r}
+fn          <- file.path(folder, "Global_search_ll.rds" )
+ll_obj      <- mif_ll(mifs_global, Np = 1e4, 146417047, n_cores = 7,
+                      fn)
+```
+
+```{r, message = FALSE, fig.height = 6.5, fig.width = 6.5, fig.align = 'center'}
+loglik_df <- extract_ll_df(ll_obj)
+
+loglik_df |> 
+  filter(loglik > max(loglik)- 20, loglik.se < 2) |>
+  bind_rows(guesses) |>
+  mutate(type=if_else(is.na(loglik),"guess","result")) |>
+  arrange(type) -> guess_result_df
+
+pairs(~loglik + par_beta + I_0 + par_rho + par_inv_phi,
+      data = guess_result_df,
+      col=ifelse(guess_result_df$type == "guess", grey(0.8), "#344D77"),
+      pch = 16, cex = 0.5)
+```
+
+### $\beta$ - Effective contact rate
+
+```{r}
+#===============================================================================
+var_name <- "par_beta"
+#===============================================================================
+```
+
+
+#### Initial likelihood surface
+
+\hfill
+
+\hfill
+
+```{r, fig.height = 2.5, fig.align ='center'}
+GBM_colour <- "#344D77"
+raw_likelihood(guess_result_df, var_name, GBM_colour)
+```
+
+#### Exploration hypercube
+
+\hfill
+
+We subsequently define a region near the MLE (hypercube) from which we draw
+several hundreds of samples. The specific number of samples varies according to
+the complexity of exploring each parameter's space. For $\zeta$, we draw 1,000 
+samples.
+
+\hfill
+
+
+```{r}
+loglik_df |>  
+  filter(loglik > max(loglik)- 20, loglik.se < 2) |> 
+  sapply(range) -> box
+
+set.seed(848406297)
+
+profile_design(
+  par_beta  = seq(0.5, 2,length = 50),
+  lower     = box[1, c("I_0", "par_rho", "par_inv_phi")],
+  upper     = box[2, c("I_0", "par_rho", "par_inv_phi")],
+  nprof     = 20, type = "sobol"
+) -> guesses
+```
+
+```{r, message = FALSE, fig.height = 3, fig.width = 3.5, fig.align = 'center'}
+plot_guesses(guesses, 0.25, GBM_colour)
+```
+
+#### Likelihood maximisation
+
+\hfill
+
+```{r}
+beta_ptb <- rw_sd(I_0 = ivp(0.02), par_inv_phi = 0.02, par_rho = 0.02)
+
+fn_ifp     <- file.path(folder, "ifp_par_beta.rds" )
+
+ifp_obj <- iter_filt_profile(mf1 = mf1, 
+                             guesses = guesses,
+                             fixed_params = fixed_params,
+                             perturbations = beta_ptb,
+                             filename = fn_ifp,
+                             seed = 23485074, n_cores = detectCores() - 1)
+```
+
+```{r, message = FALSE, fig.height = 3.5}
+profile_mif_results <- extract_mif_results(ifp_obj)
+
+profile_mif_results |>  
+  traces() |> 
+  melt() -> traces_zeta_df 
+
+mif_traces(traces_zeta_df, names(par_obj$unknown), GBM_colour)
+```

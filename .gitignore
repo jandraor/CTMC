@@ -1,0 +1,7 @@
+.Rproj.user
+.Rproj.user/
+*.Rhistory
+.RData
+.DS_Store
+*.c
+*.so
